@@ -15,17 +15,18 @@ import { AgentIdentityFields } from "./AgentDescriptionField";
 import { PersonaDropdownField } from "./PersonaDropdownField";
 import type { EnvVarsValue } from "./EnvVarsEditor";
 import { PersonaAdvancedFields } from "./PersonaAdvancedFields";
+import { PersonaOpencodeCredentialsSlot } from "./PersonaOpencodeCredentialsSection";
 import { PersonaModelField } from "./PersonaModelField";
 import { runtimeAvailabilityWarning } from "./runtimeAvailabilityWarning";
 import { PersonaProviderApiKeyField } from "./PersonaProviderApiKeyField";
 import {
   canSubmitPersonaDialog,
   formatPersonaNamePoolText,
-  parsePersonaNamePoolText,
+  personaNamePoolInput,
+  personaSubmitBaseInput,
 } from "./personaDialogState";
 import { hasText } from "./personaDialogEnvVars";
 import {
-  behaviorForSubmit,
   draftFromBehavior,
   emptyPersonaBehaviorDraft,
   personaBehaviorDraftValid,
@@ -351,30 +352,24 @@ export function AgentDefinitionDialog({
       initialProvider: initialValues.provider,
       initialModelProviderEditableWithoutRuntime,
     });
-    const namePool = parsePersonaNamePoolText(namePoolText);
-    const namePoolInput =
-      namePool.length > 0
-        ? namePool
-        : "namePool" in initialValues
-          ? []
-          : undefined;
-    const baseInput = {
-      displayName: displayName.trim(),
-      // Empty string → null happens in the API wrapper (normalizeDescription).
+    const namePoolInput = personaNamePoolInput(
+      namePoolText,
+      "namePool" in initialValues,
+    );
+    const baseInput = personaSubmitBaseInput({
+      displayName,
+      avatarUrl,
+      systemPrompt,
       description: descriptionDraft,
-      avatarUrl: avatarUrl.trim() || undefined,
-      systemPrompt: systemPrompt,
       runtime: runtimeForSubmit,
       model: modelForSubmit,
       provider: providerForSubmit,
       namePool: namePoolInput,
       envVars,
-      behavior: behaviorForSubmit(
-        behaviorDraft,
-        behaviorSeedRef.current,
-        "id" in initialValues,
-      ),
-    };
+      behaviorDraft,
+      behaviorSeed: behaviorSeedRef.current,
+      isEditMode: "id" in initialValues,
+    });
 
     if ("id" in initialValues) {
       await onSubmit(
@@ -964,6 +959,15 @@ export function AgentDefinitionDialog({
                 key="persona-advanced-fields"
                 transition={advancedFieldsTransition}
               >
+                <PersonaOpencodeCredentialsSlot
+                  disabled={isPending}
+                  personaId={
+                    initialValues && "id" in initialValues
+                      ? initialValues.id
+                      : null
+                  }
+                  runtime={runtime}
+                />
                 <PersonaAdvancedFields
                   afterRespondTo={isCreateMode ? createRunSection : undefined}
                   behaviorDraft={behaviorDraft}
