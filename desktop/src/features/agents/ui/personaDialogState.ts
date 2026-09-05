@@ -4,6 +4,11 @@ import type {
   PersonaBehaviorInput,
   UpdatePersonaInput,
 } from "@/shared/api/types";
+import type { EnvVarsValue } from "./EnvVarsEditor";
+import {
+  behaviorForSubmit,
+  type PersonaBehaviorDraft,
+} from "./personaBehaviorDraft";
 
 export type PersonaDialogState = {
   description: string;
@@ -28,6 +33,57 @@ export function canSubmitPersonaDialog(args: {
 
 export function formatPersonaNamePoolText(namePool: string[] | undefined) {
   return namePool?.join(", ") ?? "";
+}
+
+/**
+ * The id-less payload shared by persona create and update submits — assemble
+ * it once so the dialog's submit path stays a thin orchestration over
+ * dialog-state helpers.
+ */
+export function personaSubmitBaseInput(args: {
+  displayName: string;
+  avatarUrl: string;
+  systemPrompt: string;
+  description: string;
+  runtime: string | undefined;
+  model: string | undefined;
+  provider: string | undefined;
+  namePool: string[] | undefined;
+  envVars: EnvVarsValue;
+  behaviorDraft: PersonaBehaviorDraft;
+  behaviorSeed: PersonaBehaviorDraft;
+  isEditMode: boolean;
+}): Omit<UpdatePersonaInput, "id"> {
+  return {
+    displayName: args.displayName.trim(),
+    // Empty string → null happens in the API wrapper (normalizeDescription).
+    description: args.description,
+    avatarUrl: args.avatarUrl.trim() || undefined,
+    systemPrompt: args.systemPrompt,
+    runtime: args.runtime,
+    model: args.model,
+    provider: args.provider,
+    namePool: args.namePool,
+    envVars: args.envVars,
+    behavior: behaviorForSubmit(
+      args.behaviorDraft,
+      args.behaviorSeed,
+      args.isEditMode,
+    ),
+  };
+}
+
+/**
+ * Turn the dialog's name-pool text into the update/create payload value:
+ * a parsed pool when the user typed one, `[]` to clear an existing pool on
+ * edit, `undefined` to leave a create payload without one.
+ */
+export function personaNamePoolInput(
+  text: string,
+  hadNamePool: boolean,
+): string[] | undefined {
+  const namePool = parsePersonaNamePoolText(text);
+  return namePool.length > 0 ? namePool : hadNamePool ? [] : undefined;
 }
 
 export function parsePersonaNamePoolText(text: string): string[] {

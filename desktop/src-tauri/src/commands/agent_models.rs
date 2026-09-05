@@ -38,7 +38,7 @@ pub async fn get_agent_models(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<AgentModelsResponse, String> {
-    let (resolved_acp, agent_command, discovery) = {
+    let (resolved_acp, agent_command, discovery, credential_persona) = {
         let _store_guard = state
             .managed_agents_store_lock
             .lock()
@@ -82,7 +82,14 @@ pub async fn get_agent_models(
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| discovery.command.clone());
 
-        (resolved, resolved_agent, discovery)
+        // Credential isolation parity with spawn: when the persona opted into
+        // custom opencode credentials, discovery must run against the agent's
+        // isolated auth store so the model list reflects what the AGENT can
+        // authenticate with, not the owner's key. Returns the persona id for
+        // the shared provisioning-aware env extension applied after the lock.
+        let credential_persona = discovery_isolation_persona(record, &discovery);
+
+        (resolved, resolved_agent, discovery, credential_persona)
     }; // store lock released — subprocess runs without holding the lock
 
     let AgentModelDiscoveryConfig {
@@ -94,7 +101,10 @@ pub async fn get_agent_models(
         command: _,
     } = discovery;
 
-    let merged_env = discovery_env_with_baked_floor(merged_env);
+    let mut merged_env = discovery_env_with_baked_floor(merged_env);
+    if let Some(persona_id) = credential_persona {
+        crate::managed_agents::extend_env_with_isolation(&mut merged_env, &app, &persona_id);
+    }
     // Resolve against the baked/process env when the record saved no provider,
     // so a build-provided provider still gets live discovery.
     let effective_provider =
@@ -164,6 +174,27 @@ fn model_discovery_error(pubkey: &str, error: &str) -> String {
         "cannot discover models for {pubkey}: {}",
         crate::managed_agents::user_facing_harness_error(error)
     )
+}
+
+/// Resolve the credential-isolation persona for model discovery, mirroring
+/// the spawn gate: opencode harness + linked persona. The opt-in and
+/// provisioning checks live in the shared `extend_env_with_isolation`
+/// helper, so discovery's fallback semantics (opt-in without a key → default
+/// credentials) match spawn without duplicating them.
+fn discovery_isolation_persona(
+    record: &ManagedAgentRecord,
+    discovery: &AgentModelDiscoveryConfig,
+) -> Option<String> {
+    let is_opencode = crate::managed_agents::canonical_harness_command(&discovery.command)
+        .as_deref()
+        == crate::managed_agents::command_for_runtime_id(
+            crate::managed_agents::credentials::OPENCODE_RUNTIME_ID,
+        )
+        .as_deref();
+    if !is_opencode {
+        return None;
+    }
+    record.persona_id.clone()
 }
 
 #[path = "agent_models_discovery_config.rs"]

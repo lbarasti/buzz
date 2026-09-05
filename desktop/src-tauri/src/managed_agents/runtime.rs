@@ -816,6 +816,8 @@ pub fn spawn_agent_child<R: tauri::Runtime>(
         }
     }
 
+    super::credentials::apply_spawn_isolation(app, &mut command, record, effective_command);
+
     // Stamp desktop ownership and an unpredictable harness-generation identity.
     let start_nonce = uuid::Uuid::new_v4().simple().to_string();
     command
