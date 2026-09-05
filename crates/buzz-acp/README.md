@@ -163,10 +163,12 @@ The gate applies to **all** inbound events — @mentions, DMs, thread replies, a
 | `!shutdown` | Gracefully exits the harness. |
 | `!cancel` | Cancels the current in-flight turn for the command's resolved session scope, if any. |
 | `!rotate` | Rotates the ACP session for the command's resolved session scope. If a turn is in flight, it is cancelled and that scoped session is invalidated when the task returns; otherwise the cached scoped session is invalidated immediately. The next queued/received event in that scope starts a fresh session. |
+| `!model` | Lists the channel agent's model catalog and the model that applies on its next turn. Replies in-channel. |
+| `!model <id>` | Switches the channel agent's model via the same path as the Desktop model picker. If a turn is in flight it is superseded — cancelled and its batch re-queued on the new model; otherwise the next turn starts on the new model. Unsupported ids are rejected against the agent's cached catalog. Replies in-channel. |
 
-Under the default `channel` policy, a session scope is the whole channel, so these commands retain their channel-wide behavior. Under the `thread` policy, post the command as a reply in the target thread so `!cancel` or `!rotate` affects only that thread. DMs remain one conversation scope. `!cancel` is a no-op when its scope is idle.
+Under the default `channel` policy, a session scope is the whole channel, so these commands retain their channel-wide behavior. Under the `thread` policy, post the command as a reply in the target thread so `!cancel` or `!rotate` affects only that thread. `!model` stays channel-scoped regardless of policy: a model is an agent-level property, so a per-thread switch would be meaningless — the ambiguity gate refuses a channel with multiple concurrent thread sessions. DMs remain one conversation scope. `!cancel` is a no-op when its scope is idle.
 
-Owner control commands must be kind:9 stream messages from the owner, must have body exactly `!cancel`, `!rotate`, or `!shutdown` after trimming, and must mention this agent with a separate `p` tag. They are consumed by the harness instead of being forwarded to the agent. An inline `@Name` changes the body and does not match. With the Buzz CLI, target a thread while preserving the exact command body by passing the mention separately:
+Owner control commands must be kind:9 stream messages from the owner, must have body exactly `!cancel`, `!rotate`, `!shutdown`, or `!model` / `!model <id>` after trimming, and must mention this agent with a separate `p` tag. They are consumed by the harness instead of being forwarded to the agent. An inline `@Name` changes the body and does not match. With the Buzz CLI, target a thread while preserving the exact command body by passing the mention separately:
 
 ```bash
 buzz messages send --channel <channel-id> --reply-to <thread-root-id> \
