@@ -82,6 +82,12 @@ pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     // for same-session sweep decisions.
     "BUZZ_MANAGED_AGENT",
     "BUZZ_MANAGED_AGENT_START_NONCE",
+    // Credential-store redirection: opencode agents with the custom-credentials
+    // opt-in resolve their isolated auth store through these roots (see
+    // `managed_agents/credentials.rs`). A user-supplied override would point
+    // the agent's harness at an arbitrary credential store.
+    "XDG_DATA_HOME",
+    "XDG_CONFIG_HOME",
 ];
 
 pub(crate) fn is_reserved_env_key(key: &str) -> bool {

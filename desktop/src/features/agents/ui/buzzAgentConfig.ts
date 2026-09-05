@@ -78,3 +78,13 @@ export function getProviderEffortConfig(
 export function isBuzzAgentRuntime(runtimeId: string): boolean {
   return runtimeId === "buzz-agent";
 }
+
+/**
+ * Named runtime-id guard for the opencode harness — the only runtime that
+ * consumes the per-persona isolated credential store (see
+ * `managed_agents/credentials.rs` on the Rust side). Kept beside
+ * `isBuzzAgentRuntime` so render code never compares runtime ids inline.
+ */
+export function isOpencodeRuntime(runtimeId: string): boolean {
+  return runtimeId === "opencode";
+}
