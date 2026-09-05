@@ -118,7 +118,7 @@ use std::time::Instant;
 
 use buzz_core::kind::{
     KIND_AGENT_OBSERVER_FRAME, KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION,
-    KIND_TYPING_INDICATOR,
+    KIND_STREAM_MESSAGE, KIND_TYPING_INDICATOR,
 };
 use futures_util::{SinkExt, StreamExt};
 use nostr::{Event, EventBuilder, Keys, Kind, RelayUrl, Tag};
@@ -1029,6 +1029,52 @@ impl HarnessRelay {
             .tags(tags)
             .sign_with_keys(&self.keys)?;
         Ok(event)
+    }
+
+    /// Build a signed in-channel stream message (kind:9) authored by the harness
+    /// itself — used for owner-control replies (`!model`) that must not
+    /// round-trip through the agent. Carries the channel's `h` tag and an
+    /// optional `e` reply tag targeting the triggering event.
+    pub fn build_stream_message(
+        &self,
+        channel_id: Uuid,
+        content: &str,
+        reply_to: Option<&nostr::EventId>,
+    ) -> Result<Event, RelayError> {
+        let h_tag = Tag::parse(["h", &channel_id.to_string()])
+            .map_err(|e| RelayError::AuthFailed(e.to_string()))?;
+        let mut tags = vec![h_tag];
+        if let Some(reply_to) = reply_to {
+            tags.push(
+                Tag::parse(["e", &reply_to.to_hex()])
+                    .map_err(|e| RelayError::AuthFailed(e.to_string()))?,
+            );
+        }
+        let event = EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), content)
+            .tags(tags)
+            .sign_with_keys(&self.keys)?;
+        Ok(event)
+    }
+
+    /// Author and publish an in-channel stream message (kind:9) from the harness
+    /// itself. `reply_to` adds an `e` reply tag. Failed builds/publishes are
+    /// logged, never fatal — a reply must not take the harness down.
+    pub async fn publish_stream_message(
+        &self,
+        channel_id: Uuid,
+        content: &str,
+        reply_to: Option<&nostr::EventId>,
+    ) {
+        match self.build_stream_message(channel_id, content, reply_to) {
+            Ok(event) => {
+                if let Err(error) = self.publish_event(event).await {
+                    warn!(channel_id = %channel_id, "failed to publish harness stream message: {error}");
+                }
+            }
+            Err(error) => {
+                warn!(channel_id = %channel_id, "failed to build harness stream message: {error}");
+            }
+        }
     }
 
     /// Pins the floor `since` for membership notification replay.
@@ -6972,6 +7018,66 @@ mod tests {
         assert!(
             !state.channel_dropped_since.contains_key(&channel_id),
             "channel_dropped_since must be cleared on successful drain"
+        );
+    }
+
+    fn relay_with_keys(keys: Keys) -> HarnessRelay {
+        let (_, event_rx) = mpsc::channel::<Option<BuzzEvent>>(8);
+        let (cmd_tx, _) = mpsc::channel(8);
+        HarnessRelay {
+            event_rx,
+            observer_control_rx: None,
+            cmd_tx,
+            http: reqwest::Client::new(),
+            relay_url: "wss://example.test".into(),
+            keys,
+            auth_tag: None,
+            bg_handle: None,
+        }
+    }
+
+    #[test]
+    fn build_stream_message_adds_h_and_e_reply_tags() {
+        let keys = Keys::generate();
+        let relay = relay_with_keys(keys.clone());
+        let channel_id = Uuid::new_v4();
+        let reply_to = nostr::EventId::from_hex(&"ab".repeat(32)).expect("valid event id");
+
+        let event = relay
+            .build_stream_message(channel_id, "model updated to gpt-5", Some(&reply_to))
+            .expect("build stream message");
+
+        assert_eq!(event.kind.as_u16(), 9);
+        assert_eq!(event.pubkey, keys.public_key());
+        assert_eq!(event.content, "model updated to gpt-5");
+        let h = event
+            .tags
+            .iter()
+            .find(|t| t.as_slice().first().map(|s| s.as_str()) == Some("h"))
+            .expect("h tag");
+        assert_eq!(h.as_slice()[1], channel_id.to_string());
+        let e = event
+            .tags
+            .iter()
+            .find(|t| t.as_slice().first().map(|s| s.as_str()) == Some("e"))
+            .expect("e tag");
+        assert_eq!(e.as_slice()[1], reply_to.to_hex());
+    }
+
+    #[test]
+    fn build_stream_message_omits_reply_tag_without_target() {
+        let relay = relay_with_keys(Keys::generate());
+        let channel_id = Uuid::new_v4();
+        let event = relay
+            .build_stream_message(channel_id, "model: gpt-5", None)
+            .expect("build stream message");
+        assert_eq!(event.kind.as_u16(), 9);
+        assert!(
+            !event
+                .tags
+                .iter()
+                .any(|t| t.as_slice().first().map(|s| s.as_str()) == Some("e")),
+            "no e tag when there is no reply target"
         );
     }
 }

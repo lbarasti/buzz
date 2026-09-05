@@ -41,8 +41,8 @@ use filter::SubscriptionRule;
 use futures_util::FutureExt;
 use nostr::{PublicKey, ToBech32};
 use pool::{
-    AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent, PromptContext, PromptOutcome,
-    PromptResult, PromptSource, SessionState, TimeoutKind,
+    AgentPool, ChannelModelInfo, ControlSignal, IdleSwitchResult, OwnedAgent, PromptContext,
+    PromptOutcome, PromptResult, PromptSource, SessionState, TimeoutKind,
 };
 use pool_lifecycle::PoolLifecycle;
 use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
@@ -1848,43 +1848,7 @@ fn handle_switch_model_control(
         .and_then(|value| value.as_str())
         .map(str::to_string);
 
-    // A turn is in flight for this channel iff a task_map entry exists. The
-    // agent is moved out of the pool during a turn, so the control oneshot is
-    // the only reachable lever; an idle channel has no such entry.
-    let turn_in_flight = pool
-        .task_map()
-        .values()
-        .any(|m| m.channel_id == Some(channel_id));
-
-    let status = if pool.channel_control_is_ambiguous(channel_id) {
-        // The Desktop protocol names channels, not sessions. Never switch one
-        // arbitrary sibling and report a channel-wide success.
-        "ambiguous_target"
-    } else if turn_in_flight {
-        // Busy path: deliver over the oneshot. `false` means the oneshot was
-        // already consumed this turn (a prior cancel/interrupt) — the turn is
-        // already ending, so the switch cannot land on it.
-        if signal_in_flight_task(
-            pool,
-            channel_id,
-            ControlSignal::SwitchModel {
-                model_id: model_id.to_string(),
-                request_id: request_id.clone(),
-            },
-        ) {
-            "sent"
-        } else {
-            "turn_ending"
-        }
-    } else {
-        // Idle path: validate against the cached catalog before invalidating.
-        match pool.switch_idle_agent_model(channel_id, model_id, request_id.clone()) {
-            IdleSwitchResult::AmbiguousTarget => "ambiguous_target",
-            IdleSwitchResult::Switched => "switched",
-            IdleSwitchResult::UnsupportedModel => "unsupported_model",
-            IdleSwitchResult::NoIdleAgent => "no_active_turn",
-        }
-    };
+    let status = switch_channel_model(pool, channel_id, model_id, request_id.clone());
 
     if let Some(observer) = observer {
         observer.emit(
@@ -1898,13 +1862,103 @@ fn handle_switch_model_control(
             },
             serde_json::json!({
                 "type": "switch_model",
-                "status": status,
+                "status": status.as_control_status(),
                 "modelId": model_id,
                 // Echo the correlator on the immediate ack so a `sent` /
                 // `turn_ending` / idle-path terminal frame matches the pick.
                 "requestId": request_id,
             }),
         );
+    }
+}
+
+/// Outcome of [`switch_channel_model`], shared by the Desktop `switch_model`
+/// control frame and the owner `!model <id>` command.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum SwitchChannelModelStatus {
+    /// More than one session scope belongs to this channel; nothing changed.
+    AmbiguousTarget,
+    /// Busy: `SwitchModel` delivered to the in-flight turn; it cancels, sets
+    /// `desired_model`, and requeues its batch under the new model.
+    Sent,
+    /// Busy: the in-flight turn's oneshot was already consumed (a prior
+    /// cancel/interrupt), so the switch cannot land on it.
+    TurnEnding,
+    /// Idle: `desired_model` set and the session invalidated.
+    Switched,
+    /// Idle: model not in the agent's cached catalog — rejected, session untouched.
+    UnsupportedModel,
+    /// No agent available (all checked out / none spawned / no session yet).
+    NoActiveTurn,
+}
+
+impl SwitchChannelModelStatus {
+    /// Observer `control_result` status string (stable wire contract — the
+    /// Desktop matches on these literals).
+    fn as_control_status(&self) -> &'static str {
+        match self {
+            SwitchChannelModelStatus::AmbiguousTarget => "ambiguous_target",
+            SwitchChannelModelStatus::Sent => "sent",
+            SwitchChannelModelStatus::TurnEnding => "turn_ending",
+            SwitchChannelModelStatus::Switched => "switched",
+            SwitchChannelModelStatus::UnsupportedModel => "unsupported_model",
+            SwitchChannelModelStatus::NoActiveTurn => "no_active_turn",
+        }
+    }
+}
+
+/// Shared routing for a channel-wide model switch, used by both the Desktop
+/// `switch_model` observer control frame and the owner `!model <id>` command.
+///
+/// A turn is in-flight iff a `task_map` entry exists for the channel (the agent
+/// is checked out of the pool); busy channels signal
+/// [`ControlSignal::SwitchModel`] over the in-flight task's oneshot — the task
+/// cancels the turn and requeues its batch on a fresh session under the new
+/// model. Idle channels pre-validate against the cached catalog and then set
+/// `desired_model` + invalidate the session, so the next turn starts on the new
+/// model. Both paths gate on [`AgentPool::channel_control_is_ambiguous`] first:
+/// a channel-only control must never switch one arbitrary sibling session and
+/// report a channel-wide success.
+fn switch_channel_model(
+    pool: &mut AgentPool,
+    channel_id: Uuid,
+    model_id: &str,
+    request_id: Option<String>,
+) -> SwitchChannelModelStatus {
+    if pool.channel_control_is_ambiguous(channel_id) {
+        return SwitchChannelModelStatus::AmbiguousTarget;
+    }
+    // A turn is in flight for this channel iff a task_map entry exists. The
+    // agent is moved out of the pool during a turn, so the control oneshot is
+    // the only reachable lever; an idle channel has no such entry.
+    let turn_in_flight = pool
+        .task_map()
+        .values()
+        .any(|m| m.channel_id == Some(channel_id));
+    if turn_in_flight {
+        // Busy path: deliver over the oneshot. `false` means the oneshot was
+        // already consumed this turn (a prior cancel/interrupt) — the turn is
+        // already ending, so the switch cannot land on it.
+        if signal_in_flight_task(
+            pool,
+            channel_id,
+            ControlSignal::SwitchModel {
+                model_id: model_id.to_string(),
+                request_id,
+            },
+        ) {
+            SwitchChannelModelStatus::Sent
+        } else {
+            SwitchChannelModelStatus::TurnEnding
+        }
+    } else {
+        // Idle path: validate against the cached catalog before invalidating.
+        match pool.switch_idle_agent_model(channel_id, model_id, request_id) {
+            IdleSwitchResult::AmbiguousTarget => SwitchChannelModelStatus::AmbiguousTarget,
+            IdleSwitchResult::Switched => SwitchChannelModelStatus::Switched,
+            IdleSwitchResult::UnsupportedModel => SwitchChannelModelStatus::UnsupportedModel,
+            IdleSwitchResult::NoIdleAgent => SwitchChannelModelStatus::NoActiveTurn,
+        }
     }
 }
 
@@ -3507,6 +3561,65 @@ async fn tokio_main() -> Result<()> {
                                 // Not from owner — fall through to normal prompt handling.
                             }
 
+                            // Mirrors !shutdown / !cancel / !rotate: kind:9,
+                            // content "!model" or "!model <id>", from owner,
+                            // mentions THIS agent. `!model` lists the channel
+                            // agent's model catalog; `!model <id>` switches its
+                            // model through the same path as the Desktop model
+                            // picker (shared `switch_channel_model` routing).
+                            // Consumed by the harness, never forwarded to the
+                            // agent. Channel-scoped, like the Desktop control
+                            // protocol: a model is an agent-level property, so
+                            // a per-thread switch would be meaningless — the
+                            // ambiguity gate guards thread-policy channels.
+                            if kind_u32 == KIND_STREAM_MESSAGE
+                                && event_mentions_agent(&buzz_event.event, &pubkey_hex)
+                            {
+                                if let Some(model_arg) =
+                                    parse_owner_model_command(&buzz_event.event.content)
+                                {
+                                    let from_owner = owner_cache.get().is_some_and(|owner| {
+                                        buzz_event.event.pubkey.to_hex() == *owner
+                                    });
+                                    if from_owner {
+                                        let channel_id = buzz_event.channel_id;
+                                        let reply_to = Some(&buzz_event.event.id);
+                                        match model_arg {
+                                            None => {
+                                                let info =
+                                                    pool.channel_model_info(channel_id);
+                                                let reply = format_model_listing(&info);
+                                                relay
+                                                    .publish_stream_message(
+                                                        channel_id,
+                                                        &reply,
+                                                        reply_to,
+                                                    )
+                                                    .await;
+                                            }
+                                            Some(model_id) => {
+                                                let status = switch_channel_model(
+                                                    &mut pool,
+                                                    channel_id,
+                                                    &model_id,
+                                                    None,
+                                                );
+                                                let reply = format_model_switch_reply(status, &model_id);
+                                                relay
+                                                    .publish_stream_message(
+                                                        channel_id,
+                                                        &reply,
+                                                        reply_to,
+                                                    )
+                                                    .await;
+                                            }
+                                        }
+                                        continue; // consume event — do NOT push to queue
+                                    }
+                                    // Not from owner — fall through to normal prompt handling.
+                                }
+                            }
+
                             // Coarse security policy: drop events from disallowed
                             // authors before they reach subscription rules or the
                             // agent. Must be AFTER !shutdown (owner can always
@@ -4196,6 +4309,59 @@ fn is_owner_control_command(
     kind_u32 == KIND_STREAM_MESSAGE
         && event.content.trim() == command
         && event_mentions_agent(event, agent_pubkey_hex)
+}
+
+/// Parse an owner `!model` / `!model <id>` control command from trimmed stream
+/// message content.
+///
+/// Returns `Some(None)` for the bare `!model` (catalog listing), `Some(Some(id))`
+/// for `!model <id>` (switch), and `None` for anything else — including
+/// near-misses (`!models`, `!modelx`, `hey !model`) which fall through as normal
+/// messages. A model id must be a single token (ids never contain whitespace).
+fn parse_owner_model_command(content: &str) -> Option<Option<String>> {
+    let trimmed = content.trim();
+    if trimmed == "!model" {
+        return Some(None);
+    }
+    if let Some(rest) = trimmed.strip_prefix("!model ") {
+        let arg = rest.trim();
+        if !arg.is_empty() && !arg.contains(char::is_whitespace) {
+            return Some(Some(arg.to_string()));
+        }
+    }
+    None
+}
+
+/// In-channel reply copy for a `!model` listing.
+fn format_model_listing(info: &ChannelModelInfo) -> String {
+    let model = info.model_id.clone().unwrap_or_else(|| "unknown".into());
+    let available = if info.available.is_empty() {
+        "none".to_string()
+    } else {
+        info.available.join(", ")
+    };
+    format!("model: {model}\navailable: {available}")
+}
+
+/// In-channel reply copy for a `!model <id>` switch attempt.
+fn format_model_switch_reply(status: SwitchChannelModelStatus, model_id: &str) -> String {
+    match status {
+        SwitchChannelModelStatus::AmbiguousTarget => {
+            "cannot switch model — multiple sessions are active in this channel".to_string()
+        }
+        SwitchChannelModelStatus::Sent | SwitchChannelModelStatus::Switched => {
+            format!("model updated to {model_id}")
+        }
+        SwitchChannelModelStatus::TurnEnding => {
+            "turn is already ending — model not switched".to_string()
+        }
+        SwitchChannelModelStatus::UnsupportedModel => {
+            format!("{model_id} is not supported — send '!model' to list available ids")
+        }
+        SwitchChannelModelStatus::NoActiveTurn => {
+            "no agent is available — model not switched".to_string()
+        }
+    }
 }
 
 // ── signal_in_flight_task ─────────────────────────────────────────────────────
@@ -6422,6 +6588,223 @@ mod owner_control_command_tests {
             &keys,
         );
         assert!(unaddressed.is_err());
+    }
+
+    // ── !model owner command ─────────────────────────────────────────────────
+
+    async fn inert_agent(index: usize) -> OwnedAgent {
+        OwnedAgent {
+            index,
+            acp: AcpClient::spawn("cat", &[], &[], false)
+                .await
+                .expect("spawn cat as inert agent"),
+            state: Default::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "model-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        }
+    }
+
+    #[test]
+    fn parse_owner_model_command_accepts_bare_and_arg_forms() {
+        assert_eq!(parse_owner_model_command("!model"), Some(None));
+        assert_eq!(parse_owner_model_command(" !model "), Some(None));
+        assert_eq!(parse_owner_model_command("!model  "), Some(None));
+        assert_eq!(
+            parse_owner_model_command("!model gpt-5"),
+            Some(Some("gpt-5".into()))
+        );
+        assert_eq!(
+            parse_owner_model_command(" !model  gpt-5  "),
+            Some(Some("gpt-5".into()))
+        );
+    }
+
+    #[test]
+    fn parse_owner_model_command_rejects_near_misses() {
+        // Near-misses fall through as normal messages, never parsed.
+        assert_eq!(parse_owner_model_command("!models"), None);
+        assert_eq!(parse_owner_model_command("!modelx"), None);
+        assert_eq!(parse_owner_model_command("hey !model"), None);
+        assert_eq!(parse_owner_model_command("!model gpt-5 claude"), None);
+        assert_eq!(parse_owner_model_command(""), None);
+        assert_eq!(parse_owner_model_command("!modeled"), None);
+    }
+
+    #[test]
+    fn format_model_listing_renders_model_and_available_lines() {
+        let info = ChannelModelInfo {
+            model_id: Some("gpt-5".into()),
+            overridden: true,
+            available: vec!["gpt-5".into(), "gpt-5-mini".into()],
+        };
+        assert_eq!(
+            format_model_listing(&info),
+            "model: gpt-5\navailable: gpt-5, gpt-5-mini"
+        );
+
+        let empty = ChannelModelInfo {
+            model_id: None,
+            overridden: false,
+            available: vec![],
+        };
+        assert_eq!(
+            format_model_listing(&empty),
+            "model: unknown\navailable: none"
+        );
+    }
+
+    #[test]
+    fn format_model_switch_reply_covers_every_status() {
+        assert_eq!(
+            format_model_switch_reply(SwitchChannelModelStatus::Switched, "gpt-5"),
+            "model updated to gpt-5"
+        );
+        assert_eq!(
+            format_model_switch_reply(SwitchChannelModelStatus::Sent, "gpt-5"),
+            "model updated to gpt-5"
+        );
+        assert_eq!(
+            format_model_switch_reply(SwitchChannelModelStatus::UnsupportedModel, "gpt-5"),
+            "gpt-5 is not supported — send '!model' to list available ids"
+        );
+        assert_eq!(
+            format_model_switch_reply(SwitchChannelModelStatus::AmbiguousTarget, "gpt-5"),
+            "cannot switch model — multiple sessions are active in this channel"
+        );
+        assert_eq!(
+            format_model_switch_reply(SwitchChannelModelStatus::TurnEnding, "gpt-5"),
+            "turn is already ending — model not switched"
+        );
+        assert_eq!(
+            format_model_switch_reply(SwitchChannelModelStatus::NoActiveTurn, "gpt-5"),
+            "no agent is available — model not switched"
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_channel_model_idle_path_sets_override_and_invalidates_session() {
+        let channel_id = Uuid::new_v4();
+        let mut agent = inert_agent(0).await;
+        agent.state.sessions.insert(
+            scope::SessionScope::Conversation { channel_id },
+            "sess-1".into(),
+        );
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+
+        let status = switch_channel_model(&mut pool, channel_id, "gpt-5", None);
+        assert_eq!(status, SwitchChannelModelStatus::Switched);
+
+        // The idle path invalidated the session, but the listing must still
+        // surface the new override (it re-applies on the next turn).
+        let info = pool.channel_model_info(channel_id);
+        assert_eq!(info.model_id.as_deref(), Some("gpt-5"));
+        assert!(info.overridden);
+    }
+
+    #[tokio::test]
+    async fn switch_channel_model_idle_rejects_unsupported_model_without_override() {
+        let channel_id = Uuid::new_v4();
+        let mut agent = inert_agent(0).await;
+        agent.model_capabilities = Some(pool::AgentModelCapabilities {
+            config_options_raw: vec![serde_json::json!({
+                "configId": "model",
+                "category": "model",
+                "currentValue": "gpt-5",
+                "options": [{"value": "gpt-5"}],
+            })],
+            available_models_raw: Some(serde_json::json!({
+                "currentModelId": "gpt-5",
+                "availableModels": [{"modelId": "gpt-5"}],
+            })),
+            thought_level_config_id: None,
+        });
+        agent.state.sessions.insert(
+            scope::SessionScope::Conversation { channel_id },
+            "sess-1".into(),
+        );
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+
+        let status = switch_channel_model(&mut pool, channel_id, "not-a-model", None);
+        assert_eq!(status, SwitchChannelModelStatus::UnsupportedModel);
+        let info = pool.channel_model_info(channel_id);
+        assert_eq!(info.model_id.as_deref(), Some("gpt-5"));
+        assert!(
+            !info.overridden,
+            "rejected switch must not mark an override"
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_channel_model_ambiguous_never_switches_a_sibling() {
+        let channel_id = Uuid::new_v4();
+        let mut agent = inert_agent(0).await;
+        agent
+            .state
+            .sessions
+            .insert(thread_scope(channel_id, &"a".repeat(64)), "sess-a".into());
+        agent
+            .state
+            .sessions
+            .insert(thread_scope(channel_id, &"b".repeat(64)), "sess-b".into());
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+
+        let status = switch_channel_model(&mut pool, channel_id, "gpt-5", None);
+        assert_eq!(status, SwitchChannelModelStatus::AmbiguousTarget);
+        let info = pool.channel_model_info(channel_id);
+        assert!(!info.overridden, "ambiguous target must change nothing");
+    }
+
+    #[tokio::test]
+    async fn switch_channel_model_busy_delivers_switch_signal_with_request_id() {
+        let channel_id = Uuid::new_v4();
+        let mut pool = AgentPool::from_slots(vec![]);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        insert_task_meta(
+            &mut pool,
+            0,
+            scope::SessionScope::Conversation { channel_id },
+            tx,
+        );
+
+        let status = switch_channel_model(&mut pool, channel_id, "gpt-5", Some("pick-1".into()));
+        assert_eq!(status, SwitchChannelModelStatus::Sent);
+        assert_eq!(
+            rx.await.unwrap(),
+            ControlSignal::SwitchModel {
+                model_id: "gpt-5".into(),
+                request_id: Some("pick-1".into()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_channel_model_busy_reports_turn_ending_when_oneshot_consumed() {
+        let channel_id = Uuid::new_v4();
+        let mut pool = AgentPool::from_slots(vec![]);
+        let abort_handle = pool.join_set.spawn(async {});
+        pool.task_map_mut().insert(
+            abort_handle.id(),
+            pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                scope: Some(scope::SessionScope::Conversation { channel_id }),
+                turn_id: "t".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+
+        let status = switch_channel_model(&mut pool, channel_id, "gpt-5", None);
+        assert_eq!(status, SwitchChannelModelStatus::TurnEnding);
     }
 }
 
