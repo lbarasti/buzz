@@ -14,6 +14,7 @@ mod backend;
 pub(crate) mod bestie_assignment;
 pub(crate) mod claude_config;
 pub(crate) mod config_bridge;
+pub(crate) mod credentials;
 pub(crate) mod custom_harnesses;
 mod definition_validation;
 mod discovery;
@@ -73,6 +74,7 @@ pub(crate) fn lock_env_mutex() -> std::sync::MutexGuard<'static, ()> {
 }
 
 pub use backend::*;
+pub(crate) use credentials::extend_env_with_isolation;
 pub(crate) use definition_validation::{
     validate_agent_definition_text, validate_agent_description_text,
     validate_managed_agent_definition_text, validate_visible_text,
