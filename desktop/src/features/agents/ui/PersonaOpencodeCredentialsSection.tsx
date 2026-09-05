@@ -1,7 +1,8 @@
 import * as React from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Loader2, Terminal, Trash2 } from "lucide-react";
+import { AlertCircle, Loader2, Lock, Plus, Terminal, X } from "lucide-react";
 
+import { Button } from "@/shared/ui/button";
 import { Input } from "@/shared/ui/input";
 import { Switch } from "@/shared/ui/switch";
 import {
@@ -13,7 +14,10 @@ import {
 } from "@/shared/api/tauriAgentCredentials";
 import { isOpencodeRuntime } from "./buzzAgentConfig";
 import { cn } from "@/shared/lib/cn";
-import { PERSONA_FIELD_CONTROL_CLASS } from "./agentConfigOptions";
+import {
+  PERSONA_FIELD_CONTROL_CLASS,
+  PERSONA_FIELD_SHELL_CLASS,
+} from "./agentConfigOptions";
 
 const credentialStateQueryKey = (personaId: string) => [
   "persona-opencode-credentials",
@@ -120,40 +124,62 @@ export function PersonaOpencodeCredentialsSection({
       </div>
 
       {enabled ? (
-        <div className="space-y-3 rounded-md border border-border p-3">
+        <div className="space-y-2 rounded-md border border-border p-3">
           {state ? (
             state.providers.length > 0 ? (
-              <ul className="space-y-1.5">
+              <ul className="space-y-2">
                 {state.providers.map((provider) => (
-                  <li
-                    className="flex items-center justify-between gap-2"
-                    key={provider}
-                  >
-                    <span
-                      className="font-mono text-xs text-foreground"
-                      data-testid="persona-opencode-provider"
+                  <li className="flex items-center gap-2" key={provider}>
+                    <div
+                      className={cn(
+                        "flex min-h-11 flex-1 items-center gap-1.5 px-3",
+                        PERSONA_FIELD_SHELL_CLASS,
+                        "border-muted-foreground/20 bg-muted/20",
+                      )}
                     >
-                      {provider}
-                    </span>
-                    <button
+                      <Lock
+                        className="h-3 w-3 shrink-0 text-muted-foreground/40"
+                        aria-hidden
+                      />
+                      <span
+                        className="font-mono text-sm leading-6 text-foreground/60"
+                        data-testid="persona-opencode-provider"
+                      >
+                        {provider}
+                      </span>
+                    </div>
+                    <div
+                      className={cn(
+                        "flex min-h-11 flex-[2] items-center px-3",
+                        PERSONA_FIELD_SHELL_CLASS,
+                        "opacity-40",
+                      )}
+                    >
+                      <span className="font-mono text-sm text-muted-foreground">
+                        ••••••••
+                      </span>
+                    </div>
+                    <Button
                       aria-label={`Remove ${provider} credential`}
-                      className="shrink-0 text-muted-foreground hover:text-foreground disabled:opacity-50"
+                      data-testid="persona-opencode-provider-remove"
                       disabled={disabled || busy}
                       onClick={() => clearMutation.mutate(provider)}
+                      size="icon"
                       type="button"
+                      variant="ghost"
                     >
                       {clearMutation.isPending &&
                       clearMutation.variables === provider ? (
                         <Loader2 className="h-4 w-4 animate-spin" />
                       ) : (
-                        <Trash2 className="h-4 w-4" />
+                        <X className="h-4 w-4" />
                       )}
-                    </button>
+                    </Button>
                   </li>
                 ))}
               </ul>
             ) : (
-              <p className="text-xs text-muted-foreground">
+              <p className="text-xs italic text-muted-foreground">
                 No custom keys yet — this agent runs on your default credentials
                 until you add one.
               </p>
@@ -166,44 +192,76 @@ export function PersonaOpencodeCredentialsSection({
             <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
           )}
 
-          <div className="grid gap-2 sm:grid-cols-[10rem_1fr_auto]">
-            <Input
-              autoCapitalize="none"
-              autoCorrect="off"
-              className={cn("h-8", PERSONA_FIELD_CONTROL_CLASS)}
-              disabled={disabled || busy}
-              onChange={(event) => setProviderId(event.target.value)}
-              placeholder="provider (e.g. anthropic)"
-              spellCheck={false}
-              value={providerId}
-            />
-            <Input
-              autoComplete="off"
-              className={cn("h-8", PERSONA_FIELD_CONTROL_CLASS)}
-              disabled={disabled || busy}
-              onChange={(event) => setApiKey(event.target.value)}
-              placeholder="API key"
-              type="password"
-              value={apiKey}
-            />
-            <button
+          <div className="flex items-center gap-2">
+            <div
               className={cn(
-                "h-8 shrink-0 rounded-md border border-border px-3 text-xs text-foreground",
-                "hover:bg-accent disabled:opacity-50",
+                "flex min-h-11 flex-1 items-center px-3",
+                PERSONA_FIELD_SHELL_CLASS,
               )}
+            >
+              <Input
+                aria-label="Provider id"
+                autoCapitalize="none"
+                autoCorrect="off"
+                className={cn(
+                  "h-8 px-0 py-0 font-mono leading-6",
+                  PERSONA_FIELD_CONTROL_CLASS,
+                )}
+                data-testid="persona-opencode-provider-input"
+                disabled={disabled || busy}
+                onChange={(event) => setProviderId(event.target.value)}
+                placeholder="PROVIDER_ID"
+                spellCheck={false}
+                value={providerId}
+              />
+            </div>
+            <div
+              className={cn(
+                "flex min-h-11 flex-[2] items-center px-3",
+                PERSONA_FIELD_SHELL_CLASS,
+              )}
+            >
+              <Input
+                aria-label="API key"
+                autoComplete="off"
+                className={cn(
+                  "h-8 px-0 py-0 font-mono leading-6",
+                  PERSONA_FIELD_CONTROL_CLASS,
+                )}
+                data-testid="persona-opencode-api-key-input"
+                disabled={disabled || busy}
+                onChange={(event) => setApiKey(event.target.value)}
+                placeholder="API key"
+                type="password"
+                value={apiKey}
+              />
+            </div>
+            <Button
+              data-testid="persona-opencode-add-key"
               disabled={disabled || busy}
               onClick={handleSave}
+              size="sm"
               type="button"
+              variant="outline"
             >
               {setMutation.isPending ? (
                 <Loader2 className="h-4 w-4 animate-spin" />
               ) : (
-                "Save key"
+                <Plus className="mr-1 h-4 w-4" />
               )}
-            </button>
+              Add key
+            </Button>
           </div>
 
-          {error ? <p className="text-xs text-destructive">{error}</p> : null}
+          {error ? (
+            <p
+              aria-live="polite"
+              className="flex items-center gap-1 text-xs text-destructive"
+            >
+              <AlertCircle className="h-3 w-3 shrink-0" aria-hidden />
+              {error}
+            </p>
+          ) : null}
 
           <p className="text-xs text-muted-foreground">
             Takes effect on the agent&apos;s next start.
