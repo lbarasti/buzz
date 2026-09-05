@@ -1224,6 +1224,114 @@ impl AgentPool {
         self.held_since.remove(&scope);
         IdleSwitchResult::Switched
     }
+
+    /// Effective model and available ids for `channel_id`, for the owner
+    /// `!model` listing.
+    ///
+    /// Scope-aware: sessions are keyed by [`SessionScope`], so a channel lookup
+    /// matches `scope.channel_id() == channel_id` rather than a raw
+    /// channel-keyed map. Prefers the agent that owns a session for the
+    /// channel — its `desired_model` / catalog are the channel's live model
+    /// state. When no session exists for the channel yet (the catalog has not
+    /// filled in — including right after an idle switch, which invalidates the
+    /// session), falls back to the agent-level `desired_model` from the first
+    /// agent that has one: `desired_model` is agent-global and is re-applied to
+    /// every fresh session, so it is the model the channel's next turn starts
+    /// on. Empty when no agent is live.
+    pub fn channel_model_info(&self, channel_id: Uuid) -> ChannelModelInfo {
+        if let Some(agent) = self.agents.iter().flatten().find(|agent| {
+            agent
+                .state
+                .sessions
+                .keys()
+                .any(|scope| scope.channel_id() == channel_id)
+        }) {
+            return ChannelModelInfo::from_agent(agent);
+        }
+        if let Some(agent) = self
+            .agents
+            .iter()
+            .flatten()
+            .find(|agent| agent.desired_model.is_some())
+        {
+            return ChannelModelInfo::from_agent(agent);
+        }
+        ChannelModelInfo {
+            model_id: None,
+            overridden: false,
+            available: Vec::new(),
+        }
+    }
+}
+
+/// Effective model + catalog for one channel, read from the agent that owns its
+/// session scope.
+pub struct ChannelModelInfo {
+    /// Effective model: `desired_model` override, else catalog `currentModelId`.
+    pub model_id: Option<String>,
+    /// Whether `model_id` is a runtime override (Desktop pick / `!model`) vs the
+    /// harness config/persona default. Part of the `!model` listing API surface
+    /// for owner/desktop consumers; the terse reply copy omits it.
+    #[allow(dead_code)]
+    pub overridden: bool,
+    /// Deduped available ids: stable `configOptions` values first, then
+    /// `availableModels[].modelId`.
+    pub available: Vec<String>,
+}
+
+impl ChannelModelInfo {
+    fn from_agent(agent: &OwnedAgent) -> Self {
+        let available = catalog_available_ids(agent.model_capabilities.as_ref());
+        let model_id = agent.desired_model.clone().or_else(|| {
+            agent
+                .model_capabilities
+                .as_ref()
+                .and_then(|caps| caps.available_models_raw.as_ref())
+                .and_then(|models| models.get("currentModelId"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+        ChannelModelInfo {
+            model_id,
+            overridden: agent.model_overridden,
+            available,
+        }
+    }
+}
+
+/// Deduped, stable-first catalog of available model ids for an agent's cached
+/// capabilities. `configOptions` values precede `availableModels[].modelId` so
+/// the stable (spec-blessed) half names the ordering, mirroring
+/// [`model_in_catalog`]'s match precedence.
+fn catalog_available_ids(caps: Option<&AgentModelCapabilities>) -> Vec<String> {
+    let Some(caps) = caps else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    for config_opt in &caps.config_options_raw {
+        if let Some(options) = config_opt.get("options").and_then(|v| v.as_array()) {
+            for opt in options {
+                if let Some(value) = opt.get("value").and_then(|v| v.as_str()) {
+                    if seen.insert(value.to_string()) {
+                        ids.push(value.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(models) = caps.available_models_raw.as_ref() {
+        if let Some(available) = models.get("availableModels").and_then(|v| v.as_array()) {
+            for model in available {
+                if let Some(model_id) = model.get("modelId").and_then(|v| v.as_str()) {
+                    if seen.insert(model_id.to_string()) {
+                        ids.push(model_id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    ids
 }
 
 /// Outcome of [`AgentPool::hold_decision`] for one queued batch.
@@ -10453,6 +10561,124 @@ done"#
             !pool.held_since.contains_key(&scopes[0]),
             "switched scope's hold stamp cleared with its session"
         );
+    }
+
+    fn catalog_caps() -> AgentModelCapabilities {
+        AgentModelCapabilities {
+            config_options_raw: vec![serde_json::json!({
+                "configId": "model", "category": "model", "currentValue": "model-a",
+                "options": [{"value": "model-a"}, {"value": "model-b"}],
+            })],
+            available_models_raw: Some(serde_json::json!({
+                "currentModelId": "model-a",
+                "availableModels": [
+                    {"modelId": "model-a"}, {"modelId": "model-b"}, {"modelId": "model-c"},
+                ],
+            })),
+            thought_level_config_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_model_info_reports_override_and_deduped_catalog() {
+        let channel_id = Uuid::new_v4();
+        let acp = spawn_switch_acp("[]", r#""result":{}"#).await;
+        let mut agent = switching_agent(acp, "model-b");
+        agent.model_capabilities = Some(catalog_caps());
+        agent
+            .state
+            .sessions
+            .insert(SessionScope::Conversation { channel_id }, "sess-1".into());
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+
+        let info = pool.channel_model_info(channel_id);
+        assert_eq!(info.model_id.as_deref(), Some("model-b"));
+        assert!(info.overridden, "a live override must be reported");
+        assert_eq!(
+            info.available,
+            vec!["model-a", "model-b", "model-c"],
+            "configOptions values first, then availableModels, deduped"
+        );
+        pool.agents[0].as_mut().unwrap().acp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn channel_model_info_scope_aware_and_prefers_channel_session_owner() {
+        let ch_a = Uuid::new_v4();
+        let ch_b = Uuid::new_v4();
+        let acp_a = spawn_switch_acp("[]", r#""result":{}"#).await;
+        let mut agent_a = switching_agent(acp_a, "override-a");
+        agent_a.model_capabilities = Some(catalog_caps());
+        agent_a.state.sessions.insert(
+            SessionScope::Conversation { channel_id: ch_a },
+            "sess-a".into(),
+        );
+        let acp_b = spawn_switch_acp("[]", r#""result":{}"#).await;
+        let mut agent_b = switching_agent(acp_b, "override-b");
+        agent_b.model_capabilities = Some(catalog_caps());
+        agent_b.state.sessions.insert(
+            SessionScope::Conversation { channel_id: ch_b },
+            "sess-b".into(),
+        );
+        let mut pool = AgentPool::from_slots(vec![Some(agent_a), Some(agent_b)]);
+
+        let info_a = pool.channel_model_info(ch_a);
+        assert_eq!(info_a.model_id.as_deref(), Some("override-a"));
+        assert!(info_a.overridden);
+        let info_b = pool.channel_model_info(ch_b);
+        assert_eq!(info_b.model_id.as_deref(), Some("override-b"));
+        assert!(info_b.overridden);
+        for slot in &mut pool.agents {
+            if let Some(agent) = slot.as_mut() {
+                agent.acp.shutdown().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_model_info_falls_back_to_agent_desired_model_before_catalog_fills() {
+        let channel_id = Uuid::new_v4();
+        // Two agents, neither with a session for `channel_id`: the lookup falls
+        // back to the first agent's agent-global `desired_model` — which is
+        // re-applied to every fresh session, so it is what the channel's next
+        // turn starts on. The first agent carries a runtime override; the
+        // second holds the harness default.
+        let acp_override = spawn_switch_acp("[]", r#""result":{}"#).await;
+        let mut overridden = switching_agent(acp_override, "other-channel-override");
+        overridden.model_capabilities = Some(catalog_caps());
+        overridden.state.sessions.insert(
+            SessionScope::Conversation {
+                channel_id: Uuid::new_v4(),
+            },
+            "sess".into(),
+        );
+        let acp_default = spawn_switch_acp("[]", r#""result":{}"#).await;
+        let mut default_agent = switching_agent(acp_default, "harness-default");
+        default_agent.model_overridden = false;
+        default_agent.model_capabilities = Some(catalog_caps());
+        let mut pool = AgentPool::from_slots(vec![Some(overridden), Some(default_agent)]);
+
+        let info = pool.channel_model_info(channel_id);
+        assert_eq!(
+            info.model_id.as_deref(),
+            Some("other-channel-override"),
+            "no session for the channel => first live agent's desired_model"
+        );
+        assert_eq!(info.available, vec!["model-a", "model-b", "model-c"]);
+        for slot in &mut pool.agents {
+            if let Some(agent) = slot.as_mut() {
+                agent.acp.shutdown().await;
+            }
+        }
+    }
+
+    #[test]
+    fn channel_model_info_empty_when_no_agents() {
+        let pool = AgentPool::from_slots(vec![]);
+        let info = pool.channel_model_info(Uuid::new_v4());
+        assert_eq!(info.model_id, None);
+        assert!(!info.overridden);
+        assert!(info.available.is_empty());
     }
 
     #[tokio::test]
