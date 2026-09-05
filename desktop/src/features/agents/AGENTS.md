@@ -348,6 +348,8 @@ with a TypeScript lookup table or an id comparison in a component.
     for resets; owner replay of a redacted head preserves only a nonportable
     local override. That local path is not synchronized through catalog heads.
 
+18. **Custom credentials isolate a persona's harness auth store; they are never definition data.** The per-persona opt-in and the secrets both live in the desktop-managed, machine-local credential store (`managed_agents/credentials.rs`; the XDG pair is injected at spawn) — never on the shareable persona definition, never in `env_vars`, never in any persona payload. The UI reaches the store exclusively through the `get/set/clear_persona_opencode_credential` + `set_persona_opencode_credentials_enabled` IPC surface (`tauriAgentCredentials.ts`), which returns provider ids, paths, and the opt-in flag but never keys. The section renders only via the `PersonaOpencodeCredentialsSlot` gate (`isOpencodeRuntime` from `buzzAgentConfig`, never an inline id comparison) and only in edit mode (a persona must exist to provision); its copy states the fallback: an opt-in without a provisioned key keeps the owner's default credentials. Spawn and model discovery share the same gate (`apply_spawn_isolation` / `extend_env_with_isolation`) so the picker never advertises models the agent cannot authenticate with; both apply the XDG pair after user env, and both keys are reserved. Changes take effect on the agent's next start — do not add a live-restart path.
+
 ## Channel-only runtime controls
 
 Desktop observer controls identify a channel, not a thread session. The harness
